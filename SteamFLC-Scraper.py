@@ -3,24 +3,26 @@ import aiohttp
 from bs4 import BeautifulSoup
 import networkx as nx
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
 
 class SteamFLCrawler:
     def __init__(self, profile_link):
         self.initial_profile = profile_link
+        self.session = None
+
+    async def create_session(self):
+        self.session = aiohttp.ClientSession()
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+
+    async def fetch_url(self, url):
+        async with self.session.get(url) as response:
+            return await response.text()
 
     async def is_friend_list_private(self, profile_link):
-        """
-        Checks if the friend list of the given profile is private.
-        
-        Parameters:
-            profile_link (str): The link to the Steam profile to check the friend list privacy.
-        
-        Returns:
-            bool: True if the friend list is private, False otherwise.
-        """
-        async with aiohttp.ClientSession() as session:
-            async with session.get(profile_link) as response:
-                res = await response.text()
+        res = await self.fetch_url(profile_link)
         document = BeautifulSoup(res, 'html.parser')
 
         if document.select_one('.profile_private_info'):
@@ -32,24 +34,11 @@ class SteamFLCrawler:
         return False
 
     async def get_friend_list(self, profile_link):
-        """
-        Retrieves the list of friends for a given Steam profile link.
-
-        Parameters:
-            profile_link (str): The link to the Steam profile for which the friend list is to be retrieved.
-
-        Returns:
-            list: A list of tuples containing the Steam ID and name of each friend.
-        """
         if await self.is_friend_list_private(profile_link):
             return None
 
         friends_page_url = profile_link + "friends/"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(friends_page_url) as response:
-                res = await response.text()
-
+        res = await self.fetch_url(friends_page_url)
         document = BeautifulSoup(res, 'html.parser')
 
         friend_profiles = []
@@ -62,39 +51,33 @@ class SteamFLCrawler:
         return friend_profiles
 
     async def get_friend_lists(self, friends):
-        """
-        Retrieves the friend lists for a list of friends.
-
-        Args:
-            friends (list): A list of tuples containing the Steam ID and name of each friend.
-
-        Returns:
-            dict: A dictionary containing the friend lists, where the keys are the Steam IDs and the values are lists of tuples containing the Steam ID and name of each friend.
-        """
-        friend_lists = {}
+        tasks = []
         for steam_id, _ in friends:
             profile_url = f"https://steamcommunity.com/profiles/{steam_id}/"
-            friend_list = await self.get_friend_list(profile_url)
-            if friend_list is not None:
-                friend_lists[steam_id] = friend_list
-        return friend_lists
+            tasks.append(self.get_friend_list(profile_url))
+
+        results = await asyncio.gather(*tasks)
+        return {steam_id: friend_list for (steam_id, _), friend_list in zip(friends, results) if friend_list is not None}
 
 async def main():
     profile_link = input("Enter the Steam profile link: ")
     crawler = SteamFLCrawler(profile_link)
     
+    await crawler.create_session()
+
     initial_friend_list = await crawler.get_friend_list(profile_link)
     if initial_friend_list is None:
         print("Friend list is not available for this profile.")
+        await crawler.close_session()
         return
 
     friend_lists = await crawler.get_friend_lists(initial_friend_list)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(profile_link) as response:
-            res = await response.text()
+    res = await crawler.fetch_url(profile_link)
     document = BeautifulSoup(res, 'html.parser')
     profile_name = document.select_one('.actual_persona_name').get_text(strip=True)
+
+    await crawler.close_session()
 
     G = nx.Graph()
     G.add_node(profile_link, label=profile_name)
@@ -116,6 +99,11 @@ async def main():
         isolated_nodes = [node for node, degree in dict(G.degree()).items() if degree == 1 and node != profile_link]
         G.remove_nodes_from(isolated_nodes)
 
+    # Use a separate thread for plotting to avoid blocking the event loop
+    with ThreadPoolExecutor() as executor:
+        executor.submit(plot_graph, G, profile_link)
+
+def plot_graph(G, profile_link):
     pos = nx.spring_layout(G)
     labels = nx.get_node_attributes(G, 'label')
     nx.draw(G, pos, labels=labels, with_labels=True, node_size=300, node_color="skyblue", font_size=10, font_color="black", font_weight="bold", edge_color="gray")
